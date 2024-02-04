@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include "list.h"
 
 #define MAX_ORDER 32
@@ -106,6 +107,7 @@ void tbs_init(struct tiny_buddy_system *buddy_sys, long start, long end)
         }
 
         entry = (struct freelist_entry *)current_start;
+        INIT_LIST_HEAD(&entry->node);
         list_add(&entry->node, &buddy_sys->freelists[order]);
 
         buddy_sys->total += size;
@@ -142,10 +144,17 @@ void *tbs_alloc(struct tiny_buddy_system *buddy_sys, unsigned long size)
             struct freelist_entry *splited, *splited_buddy;
             struct list_head *next_freelist = &buddy_sys->freelists[split_order - 1];
 
+            assert(!list_empty(&buddy_sys->freelists[split_order]));
             entry = list_first_entry(&buddy_sys->freelists[split_order], struct freelist_entry, node);
+            pr_debug("entry %p, order %d", entry, order);
             list_del(&entry->node);
+            if (!list_empty(&buddy_sys->freelists[split_order])) {
+                assert(list_first_entry(&buddy_sys->freelists[split_order], struct freelist_entry, node) != entry);
+            }
             splited = entry;
             splited_buddy = (struct freelist_entry *)((long)entry + (1 << (split_order - 1)));
+            INIT_LIST_HEAD(&splited->node);
+            INIT_LIST_HEAD(&splited_buddy->node);
 
             list_add(&splited->node, next_freelist);
             list_add(&splited_buddy->node, next_freelist);
@@ -157,6 +166,11 @@ void *tbs_alloc(struct tiny_buddy_system *buddy_sys, unsigned long size)
     target_freelist = &buddy_sys->freelists[class];
     if (list_empty(target_freelist)) {
         printf("%s: OOM!\n", __func__);
+        for (int i = 0; i < MAX_ORDER; i++) {
+            if (!list_empty(&buddy_sys->freelists[i])) {
+                printf("%s: order %d still free\n", __func__, i);
+            }
+        }
         return NULL;
     }
 
@@ -166,7 +180,7 @@ void *tbs_alloc(struct tiny_buddy_system *buddy_sys, unsigned long size)
     buddy_sys->allocated += roundup_size;
     buddy_sys->user_requested += size;
 
-    pr_debug("allocated++: %d, user requested++: %d", roundup_size, size);
+    pr_debug("allocated: %d, user requested: %d", buddy_sys->allocated, buddy_sys->user_requested);
     return target_entry;
 
 }
@@ -186,6 +200,8 @@ void tbs_free(struct tiny_buddy_system *buddy_sys, void *ptr, unsigned long size
     assert(class < MAX_ORDER);
 
     entry = (struct freelist_entry *)(ptr);
+    INIT_LIST_HEAD(&entry->node);
+    list_add(&entry->node, &buddy_sys->freelists[class]);
     for (order = class; order < MAX_ORDER; order++) {
         struct freelist_entry *buddy = (struct freelist_entry *)((long)entry ^ (1 << order));
         struct freelist_entry *iter = NULL;
@@ -198,19 +214,14 @@ void tbs_free(struct tiny_buddy_system *buddy_sys, void *ptr, unsigned long size
             }
 
         if (buddy_is_free) {
-            if (order == MAX_ORDER - 1) {
-                list_add(&entry->node, &buddy_sys->freelists[order]);
-                break;
-            }
+            pr_debug("buddy is free, order %d", order);
+            list_del(&entry->node);
             list_del(&buddy->node);
-            if ((long)entry < (long)buddy) 
-                list_add(&entry->node, &buddy_sys->freelists[order + 1]);
-            else {
-                list_add(&buddy->node, &buddy_sys->freelists[order + 1]);
+            if ((long)entry > (long)buddy) 
                 entry = buddy;
-            }
+            pr_debug("entry %p, order %d", entry, order);
+            list_add(&entry->node, &buddy_sys->freelists[order + 1]);
         } else {
-            list_add(&entry->node, &buddy_sys->freelists[order]);
             break;
         }
     }
@@ -218,7 +229,7 @@ void tbs_free(struct tiny_buddy_system *buddy_sys, void *ptr, unsigned long size
     buddy_sys->allocated -= roundup_size;
     buddy_sys->user_requested -= size;
 
-    pr_debug("allocated--: %d, user requested--: %d", roundup_size, size);
+    pr_debug("allocated: %d, user requested: %d", buddy_sys->allocated buddy_sys->user_requested);
 
 }
 
@@ -227,19 +238,29 @@ struct tiny_buddy_system buddy_sys;
 int main()
 {
     long start, end;
-    long long len = 8 * 1024 * 1024;
+    long len = 8 * 1024 * 1024;
 
     start = (long)mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     assert(start);
     end = start + len;
     tbs_init(&buddy_sys, start, end);
     char *dummy = tbs_alloc(&buddy_sys, 10);
+    assert(dummy);
     printf("1\n");
     char *dummy2 = tbs_alloc(&buddy_sys, len / 2);
+    assert(dummy2);
     printf("2\n");
     char *dummy3 = tbs_alloc(&buddy_sys, len / 4);
+    assert(dummy3);
     printf("3\n");
     tbs_free(&buddy_sys, dummy, 10);
-    char *dummy4 = tbs_alloc(&buddy_sys, len / 4);
+    int step = 1;
+    for (long i = 0; i < len / 4; i += step) {
+        char *dummy4 = tbs_alloc(&buddy_sys, step);
+        if (!dummy4) {
+            printf("i %ld, i * 16: %ld, total %ld\n", i, i * 16, len / 4);
+            _exit(-1);
+        }
+    }
     printf("4\n");
 }
